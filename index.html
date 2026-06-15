@@ -66,12 +66,12 @@
   .btn:active:not(:disabled){ transform:scale(.97); }
   .btn:disabled{ opacity:.5; cursor:default; }
   .btn.saved{ background:#34c759; }
-  .hint{ font-size:13px; color:#ff453a; margin:10px 0 0; }
+  .hint{ font-size:13px; color:#ff453a; margin:10px 0 0; line-height:1.5; word-break:break-word; }
   .hint.info{ color:var(--muted); }
 
   .res-head{ display:flex; align-items:baseline; justify-content:space-between; margin:2px 0 16px; }
   .res-title{ font-size:18px; font-weight:600; }
-  .refresh{ border:none; background:none; color:var(--blue); font-size:14px; cursor:pointer; font-family:inherit; }
+  .live{ font-size:12px; color:#34c759; font-weight:600; }
   .row{ margin-bottom:14px; }
   .row:last-child{ margin-bottom:0; }
   .row-top{ display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
@@ -119,16 +119,47 @@
   <div class="card">
     <div class="res-head">
       <span id="restitle" class="res-title">目前統計</span>
-      <button id="refresh" class="refresh">重新整理</button>
+      <span id="live" class="live"></span>
     </div>
     <div id="results"></div>
   </div>
 </div>
 
+<!-- 守門員：若模組（Firebase CDN）載入失敗，6 秒後提示 -->
 <script>
-const WEEKDAYS = ["日","一","二","三","四","五","六"];
-const API = "api.php";
+  window.__appReady = false;
+  setTimeout(function(){
+    if(!window.__appReady){
+      var h = document.getElementById("hint");
+      if(h){
+        h.className = "hint";
+        h.textContent = "頁面載入失敗：可能無法連到 Firebase 的 CDN（www.gstatic.com）。若你在公司網路測試，請改用一般網路或手機。";
+      }
+    }
+  }, 6000);
+</script>
 
+<script type="module">
+/* ============================================================
+   ① 把你的 Firebase 設定貼在這裡（從 Firebase 主控台複製）
+   ============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyCu0knrHrfKgVZ27Ex66lA7FoEUykpyw54",
+  authDomain: "vote-b237d.firebaseapp.com",
+  projectId: "vote-b237d",
+  storageBucket: "vote-b237d.firebasestorage.app",
+  messagingSenderId: "29504862445",
+  appId: "1:29504862445:web:c21255e925fb7a9f1eb4e4",
+  measurementId: "G-Z3GJ2PN0LR"
+};
+/* ============================================================ */
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
+import {
+  getFirestore, collection, doc, setDoc, onSnapshot
+} from "https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js";
+
+const WEEKDAYS = ["日","一","二","三","四","五","六"];
 const pad = n => String(n).padStart(2,"0");
 const dateKey = (y,m,d) => `${y}-${pad(m+1)}-${pad(d)}`;
 function fmtDate(dk){
@@ -143,18 +174,12 @@ const state = {
   viewYear:today.getFullYear(), viewMonth:today.getMonth(),
   saved:false, loadedName:""
 };
-
 const $ = id => document.getElementById(id);
 
-async function loadVotes(){
-  try{
-    const res = await fetch(API + "?action=list", { cache:"no-store" });
-    const data = await res.json();
-    state.votes = Array.isArray(data) ? data : [];
-  }catch(e){
-    setHint("無法連到伺服器，請確認 Apache 已啟動", false);
-  }
-  renderCalendar(); renderResults();
+function setHint(msg, info){
+  const h = $("hint");
+  h.textContent = msg || "";
+  h.className = "hint" + (info ? " info" : "");
 }
 
 function maybeLoadExisting(){
@@ -169,12 +194,6 @@ function maybeLoadExisting(){
   }
 }
 
-function setHint(msg, info){
-  const h = $("hint");
-  h.textContent = msg || "";
-  h.className = "hint" + (info ? " info" : "");
-}
-
 function tally(){
   const t = {};
   state.votes.forEach(v => (v.dates||[]).forEach(d => { (t[d]=t[d]||[]).push(v.name); }));
@@ -184,8 +203,7 @@ function tally(){
 function renderCalendar(){
   const { viewYear:y, viewMonth:m } = state;
   $("month").textContent = `${y} 年 ${m+1} 月`;
-  const atCurrent = (y===today.getFullYear() && m===today.getMonth());
-  $("prev").disabled = atCurrent;
+  $("prev").disabled = (y===today.getFullYear() && m===today.getMonth());
 
   const t = tally();
   const firstWd = new Date(y,m,1).getDay();
@@ -268,29 +286,60 @@ function updateSaveBtn(){
   btn.textContent = state.saved ? "已送出 ✓" : "送出我的選擇";
 }
 
+// ---- Firebase ----
+const configMissing =
+  !firebaseConfig.apiKey ||
+  /YOUR_|PASTE_|xxxx/i.test(firebaseConfig.apiKey) ||
+  !firebaseConfig.projectId ||
+  /YOUR_/i.test(firebaseConfig.projectId);
+
+let db = null;
+
+function listenVotes(){
+  onSnapshot(
+    collection(db, "votes"),
+    (snap) => {
+      const all = [];
+      snap.forEach(d => { const v = d.data(); if(v && v.name) all.push(v); });
+      state.votes = all;
+      $("live").textContent = "● 即時";
+      renderCalendar();
+      renderResults();
+    },
+    (err) => {
+      setHint("無法讀取資料：" + err.message + "（常見原因：Firestore 安全規則未開放，請見下方說明）", false);
+    }
+  );
+}
+
 async function save(){
   const name = state.name.trim();
   if(!name){ setHint("先填上你的名字吧", false); return; }
   if(state.selected.size === 0){ setHint("至少選一個你方便的日期", false); return; }
+  if(configMissing || !db){
+    setHint("⚠ 尚未填入 Firebase 設定，投票無法儲存。請依下方步驟把 firebaseConfig 貼到檔案上方。", false);
+    return;
+  }
   const btn = $("save"); btn.disabled = true; btn.textContent = "送出中…";
   try{
-    const res = await fetch(API, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ name, dates:[...state.selected].sort() })
+    let id = name.toLowerCase().replace(/\//g, "_").trim();
+    if(id === "" || id === "." || id === "..") id = "user_" + Date.now();
+    await setDoc(doc(db, "votes", id), {
+      name,
+      dates: [...state.selected].sort(),
+      updatedAt: Date.now()
     });
-    if(!res.ok) throw new Error();
     state.loadedName = name.toLowerCase();
     state.saved = true; setHint("");
-    await loadVotes();
+    // onSnapshot 會自動更新統計
   }catch(e){
-    setHint("送出時出了點問題，再試一次", false);
+    setHint("送出失敗：" + e.message + "（常見原因：Firestore 安全規則未開放寫入）", false);
   }finally{
     btn.disabled = false; updateSaveBtn();
   }
 }
 
-// navigation
+// ---- wire up UI ----
 $("prev").onclick = () => {
   if($("prev").disabled) return;
   if(state.viewMonth===0){ state.viewYear--; state.viewMonth=11; }
@@ -305,9 +354,22 @@ $("next").onclick = () => {
 $("name").addEventListener("input", e => { state.name = e.target.value; });
 $("name").addEventListener("blur", maybeLoadExisting);
 $("save").onclick = save;
-$("refresh").onclick = loadVotes;
 
-loadVotes();
+renderCalendar();
+renderResults();
+window.__appReady = true; // 通知守門員：模組已成功載入
+
+if(configMissing){
+  setHint("⚠ 尚未填入 Firebase 設定。請依下方步驟建立 Firebase 專案，把 firebaseConfig 貼到本檔上方標示處，投票才會運作。", false);
+}else{
+  try{
+    const app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    listenVotes();
+  }catch(e){
+    setHint("Firebase 初始化失敗：" + e.message, false);
+  }
+}
 </script>
 </body>
 </html>
